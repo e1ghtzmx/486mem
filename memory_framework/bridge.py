@@ -144,8 +144,25 @@ _REPLY = (
     'To stay silent for a finished or declined exchange, use {"action":"skip"} with no reply. '
     "For a greeting, good news or venting, acknowledge the concrete detail briefly and end with a statement. "
     "Ask one focused follow-up only when the user seeks help and a key detail is needed, when an unresolved "
-    "reference affects the answer, or when a shared commitment calls for asking. For ambiguous options, ask "
-    "which one before acting. If a useful answer is already possible, give it first."
+    "reference affects the answer, or when a shared commitment calls for asking. "
+    "Give a useful answer first when it does not require resolving an open reference."
+)
+_REFERENCE = (
+    "Resolve references such as 'that one' before confirming an action on them. Check the current wording "
+    "and recent turns for a unique description, an explicit selection or a later change to that selection. "
+    "A uniquely described option or a sole remaining option already resolves the reference. "
+    "When there is one match, name it in a statement and continue. A yes/no confirmation is still an "
+    "unnecessary question. This turn's unique description takes precedence over an older selection or an "
+    "earlier open list. 'The other one' is definite only when a known choice leaves one alternative. "
+    "A list of options, a comparison, a suggestion or the fact that one option was mentioned last leaves "
+    "a choice open. If the user's action depends on which of several still-open options they mean, ask one "
+    "question naming the alternatives. Do not first say you will act or just repeat 'that one'. "
+    "Example: earlier '上午或傍晚的车都可以，还没定', now '刚才说的那班先留一下' "
+    "→ '你想留上午那班，还是傍晚那班？' "
+    "If the user had instead already said '选傍晚那班', reply '好，先留着傍晚那班。' "
+    "With one large envelope and one small envelope, '把大号那个放这儿' → '好，大号信封放这儿。' "
+    "If the charger is the sole item on the packing list, '把那个带上' → '好，带上充电器。' "
+    "Apply the same distinction in the user's reply language."
 )
 _INITIATIVE = (
     "This is a proactive opportunity; there is no new user message awaiting a reply. "
@@ -240,6 +257,7 @@ class MemoryBridge:
             for_initiative=initiative, confirmed_only=True,
         )
         branches = _INITIATIVE_BRANCHES if initiative else _REPLY_BRANCHES
+        dialogue = (_INITIATIVE,) if initiative else (_REPLY, _REFERENCE)
         hints = []
         if initiative and event["text"].strip():
             candidates = self.store.recall(
@@ -266,7 +284,7 @@ class MemoryBridge:
                 for name, schema in _SCHEMAS.items()
             ],
             "decision_schema": {"oneOf": deepcopy(list(branches.values()))},
-            "instructions": "\n\n".join((_INITIATIVE if initiative else _REPLY, _LANGUAGE, _INSTRUCTIONS)),
+            "instructions": "\n\n".join((*dialogue, _LANGUAGE, _INSTRUCTIONS)),
         }
 
     def run_turn(self, scope: Scope, event_id: str, model, *, persona=None, language=None,
