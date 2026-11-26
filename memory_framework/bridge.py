@@ -17,9 +17,10 @@ from .store import (
 )
 
 
-PROTOCOL_VERSION = "1"
-_ACTIONS = ("speak", "wait", "skip")
+PROTOCOL_VERSION = "2"
 _EXCERPT_LENGTH = 500
+_QUOTE_MIN = 4
+_QUOTE_MAX = 120
 
 _TEXT = {"type": "string"}
 _REF_ID = {**_TEXT, "minLength": 1, "maxLength": MAX_REF_ID_LENGTH}
@@ -77,18 +78,33 @@ _DESCRIPTIONS = {
     "memory_read_evidence": "Read source events by ID to verify a memory claim or recover details.",
     "memory_propose": "Propose an evidence-backed change or update a memory's importance within this scope.",
 }
-_DECISION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "action": {"enum": list(_ACTIONS)},
-        "reply": _TEXT,
-        "topic": _TEXT,
-        "reason": _TEXT,
-        "evidence_ids": _IDS,
-        "review_at": _TIMESTAMP,
-    },
-    "required": ["action"],
-    "additionalProperties": False,
+def _decision_branch(action, *, fields=None, required=()):
+    return {
+        "type": "object",
+        "properties": {"action": {"const": action}, **(fields or {})},
+        "required": ["action", *required],
+        "additionalProperties": False,
+    }
+
+
+_SILENT_BRANCHES = {
+    "wait": _decision_branch("wait", fields={"review_at": _TIMESTAMP}),
+    "skip": _decision_branch("skip"),
+}
+_REPLY_BRANCHES = {
+    "speak": _decision_branch("speak", fields={"reply": _TEXT, "evidence_ids": _IDS}, required=("reply",)),
+    **_SILENT_BRANCHES,
+}
+_EXPERIENCE_FIELDS = {
+    "reply": _TEXT,
+    "topic": _TEXT,
+    "reason": _TEXT,
+    "evidence_ids": {**_IDS, "minItems": 1},
+    "experience_quote": {**_TEXT, "minLength": _QUOTE_MIN, "maxLength": _QUOTE_MAX},
+}
+_INITIATIVE_BRANCHES = {
+    "speak": _decision_branch("speak", fields=_EXPERIENCE_FIELDS, required=_EXPERIENCE_FIELDS),
+    **_SILENT_BRANCHES,
 }
 
 _INSTRUCTIONS = (
@@ -113,10 +129,39 @@ _INSTRUCTIONS = (
     "base_version to the head_version returned by recall. "
     "For revise, use correction for a mistaken older account, supersession for a real change, "
     "conflict for competing accounts and unknown when the relationship is unclear. "
-    "Use restrict to stop proactive mentions and restrict with value false to restore them, with host approval. "
-    "Return a turn decision with action speak, wait or skip. Speak requires a reply. "
-    "For a proactive opportunity, speak also requires a concrete topic, a brief reason to speak now "
-    "and evidence IDs tied to the shared history. The host controls actual delivery."
+    "Use restrict to stop proactive mentions and restrict with value false to restore them, with host approval."
+)
+_LANGUAGE = (
+    "Before speaking, read the values in habits. These are confirmed, in-scope preferences supplied by the host. "
+    "Choose the reply language and register in this order: first an explicit user request for this turn; then "
+    "the host's language default, if present; then a default or register described in the confirmed habits. "
+    "A greeting written in a different language leaves the default in effect. Fall back to the language of the "
+    "user's message only if there is no default. Use the chosen language and register for the entire reply."
+)
+_REPLY = (
+    'This is a conversation reply, not an unsolicited opener. Use {"action":"speak","reply":"your reply"}. '
+    'If the user says they are still sending the rest, return {"action":"wait"} with no reply. '
+    'To stay silent for a finished or declined exchange, use {"action":"skip"} with no reply. '
+    "For a greeting, good news or venting, acknowledge the concrete detail briefly and end with a statement. "
+    "Ask one focused follow-up only when the user seeks help and a key detail is needed, when an unresolved "
+    "reference affects the answer, or when a shared commitment calls for asking. For ambiguous options, ask "
+    "which one before acting. If a useful answer is already possible, give it first."
+)
+_INITIATIVE = (
+    "This is a proactive opportunity; there is no new user message awaiting a reply. "
+    "A chance to speak or a permission to contact the user does not supply a topic. "
+    "Look for a specific shared experience and a timely new contribution. If the user owns the next move, "
+    "the topic is closed, or there is no concrete reason to speak, return {\"action\":\"skip\"} with no reply. "
+    "Use {\"action\":\"wait\"} when there is a concrete reason to defer, also with no reply. "
+    "To speak, first find the real earlier event that contains the detail you want to use. If it isn't in "
+    "the recent excerpts, call memory_recall with intent evidence and read the event if needed. Then return "
+    '{"action":"speak","reply":"message to the user","topic":"specific shared topic","reason":"why now",'
+    '"evidence_ids":["actual event_id of the shared experience"],"experience_quote":"short exact excerpt"}. '
+    "The first evidence ID must be the event containing the quoted experience. Permission and style habits "
+    "can be secondary evidence. If you cannot find the experience, skip instead of filling the gap. "
+    "If experience_hints gives a promising event ID, use memory_read_evidence to see its text before deciding. "
+    "The internal opportunity text is not a user message or a language sample; absent a language default, "
+    "use the language the user previously used in the conversation. The host controls actual delivery."
 )
 
 
@@ -194,6 +239,20 @@ class MemoryBridge:
             scope, intent="habit", limit=5, as_of=event["occurred_at"], known_at=event["occurred_at"],
             for_initiative=initiative, confirmed_only=True,
         )
+        branches = _INITIATIVE_BRANCHES if initiative else _REPLY_BRANCHES
+        hints = []
+        if initiative and event["text"].strip():
+            candidates = self.store.recall(
+                scope, query=event["text"][:MAX_QUERY_LENGTH], intent="evidence", limit=8,
+                known_at=event["occurred_at"], for_initiative=True, exclude_kinds=("opportunity",),
+            )
+            recent_ids = {item["event_id"] for item in recent}
+            hints = [
+                {key: item[key] for key in ("event_id", "kind", "occurred_at")}
+                for item in candidates
+                if item["event_id"] not in recent_ids
+                and self.store._is_shared_experience(scope, item, event["occurred_at"])
+            ][:4]
         return {
             "protocol_version": PROTOCOL_VERSION,
             "event": event,
@@ -201,12 +260,13 @@ class MemoryBridge:
             "language": language,
             "habits": [_habit_preview(habit) for habit in habits],
             "recent_events": [_recent_event(item) for item in reversed(recent)],
+            **({"experience_hints": hints} if initiative else {}),
             "tools": [
                 {"name": name, "description": _DESCRIPTIONS[name], "input_schema": deepcopy(schema)}
                 for name, schema in _SCHEMAS.items()
             ],
-            "decision_schema": deepcopy(_DECISION_SCHEMA),
-            "instructions": _INSTRUCTIONS,
+            "decision_schema": {"oneOf": deepcopy(list(branches.values()))},
+            "instructions": "\n\n".join((_INITIATIVE if initiative else _REPLY, _LANGUAGE, _INSTRUCTIONS)),
         }
 
     def run_turn(self, scope: Scope, event_id: str, model, *, persona=None, language=None,
@@ -287,23 +347,22 @@ class MemoryBridge:
     def validate_decision(self, scope: Scope, event_id: str, decision: dict, *, now=None) -> dict:
         """Validate a model decision. The host may choose whether to deliver it."""
         event = self._event(scope, event_id)
-        _check_fields(decision, _DECISION_SCHEMA, "decision")
-        action = decision["action"]
-        if action not in _ACTIONS:
+        initiative = event["kind"] == "opportunity"
+        branches = _INITIATIVE_BRANCHES if initiative else _REPLY_BRANCHES
+        action = decision.get("action") if isinstance(decision, dict) else None
+        if not isinstance(action, str) or action not in branches:
             raise ValueError("decision action must be speak, wait or skip")
-        for key in ("reply", "topic", "reason"):
+        _check_fields(decision, branches[action], "decision")
+        for key in ("reply", "topic", "reason", "experience_quote"):
             if key in decision and not isinstance(decision[key], str):
                 raise ValueError(f"{key} must be a string")
         reply = decision.get("reply", "").strip()
         if bool(reply) != (action == "speak"):
             raise ValueError("only speak decisions can contain a non-empty reply")
         ids = _read_ids(decision.get("evidence_ids", []), "evidence_ids")
-        initiative = event["kind"] == "opportunity"
         sources = self._require_evidence(scope, ids, initiative, event["occurred_at"]) if ids else ()
 
         if "review_at" in decision:
-            if action != "wait":
-                raise ValueError("review_at is only valid for wait")
             _time(decision["review_at"], "review_at")
         if initiative and action == "speak":
             metadata = event["metadata"]
@@ -316,8 +375,11 @@ class MemoryBridge:
                 raise ValueError("proactive opportunity has not started")
             if current >= expires:
                 raise ValueError("proactive opportunity has expired")
-            if not all(decision.get(key, "").strip() for key in ("topic", "reason")):
-                raise ValueError("proactive speech requires a topic, a reason and evidence")
-            if not any(source["kind"] != "opportunity" for source in sources):
-                raise ValueError("proactive speech requires evidence from shared history")
+            if not all(decision[key].strip() for key in ("topic", "reason")):
+                raise ValueError("proactive speech requires a topic and a reason")
+            if not sources or not self.store._is_shared_experience(scope, sources[0], event["occurred_at"]):
+                raise ValueError("the first evidence ID must identify a shared experience")
+            quote = decision["experience_quote"].strip()
+            if not _QUOTE_MIN <= len(quote) <= _QUOTE_MAX or quote not in sources[0]["text"]:
+                raise ValueError("experience_quote must be an exact excerpt from the first evidence event")
         return {**decision, **({"reply": reply} if "reply" in decision else {})}

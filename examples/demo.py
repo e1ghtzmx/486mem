@@ -22,6 +22,7 @@ def rehearsal_model(context, exchanges):
         "topic": "这次排练的节拍",
         "reason": "接回用户确实提到的慢节拍，并提供一个新练法。",
         "evidence_ids": [evidence["event_id"]],
+        "experience_quote": "慢一点的节拍",
     }}
 
 

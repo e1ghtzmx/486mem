@@ -434,6 +434,61 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(old_memories, new_memories)
         self.assertIn("先接细节", str(old_memories))
 
+    def test_open_turn_exposes_only_the_current_turn_decision_schema(self):
+        self.record("message", "说点什么。")
+        self.record("opportunity", kind="opportunity", metadata={
+            "allowed": True, "expires_at": "2020-06-01T15:00:00+00:00",
+        })
+        bridge = MemoryBridge(self.store)
+        normal = bridge.open_turn(self.scope, "message", language="ja")
+        proactive = bridge.open_turn(self.scope, "opportunity")
+        self.assertEqual(normal["language"], "ja")
+        self.assertEqual((normal["protocol_version"], proactive["protocol_version"]), ("2", "2"))
+        common_fields = {"action", "reply", "evidence_ids"}
+        for turn, allowed, required in (
+            (normal, common_fields, {"action", "reply"}),
+            (proactive, common_fields | {"topic", "reason", "experience_quote"},
+             common_fields | {"topic", "reason", "experience_quote"}),
+        ):
+            with self.subTest(event=turn["event"]["event_id"]):
+                branches = turn["decision_schema"]["oneOf"]
+                self.assertEqual(len(branches), 3)
+                speak = next(branch for branch in branches if "reply" in branch["properties"])
+                self.assertEqual(set(speak["properties"]), allowed)
+                self.assertEqual(set(speak["required"]), required)
+                self.assertIn({"action", "review_at"}, [set(branch["properties"]) for branch in branches])
+                self.assertIn({"action"}, [set(branch["properties"]) for branch in branches])
+
+        self.assertEqual(bridge.validate_decision(self.scope, "message", {
+            "action": "speak", "reply": "了解。",
+        }), {"action": "speak", "reply": "了解。"})
+        self.assertEqual(bridge.validate_decision(self.scope, "message", {
+            "action": "wait", "review_at": "2020-06-01T14:20:00+00:00",
+        })["action"], "wait")
+        with self.assertRaises(ValueError):
+            bridge.validate_decision(self.scope, "message", {
+                "action": "speak", "reply": "了解。", "topic": "日常闲聊",
+            })
+        with self.assertRaises(ValueError):
+            bridge.validate_decision(self.scope, "opportunity", {
+                "action": "skip", "reply": "我先不打扰了。",
+            })
+
+    def test_opportunity_hints_point_to_older_shared_events_without_copying_text(self):
+        self.record("original", "合奏时蓝色节拍器是我们最早选的道具。", at="2020-06-01T12:00:00+00:00")
+        self.record("policy", "合奏话题可以主动分享。", at="2020-06-01T12:10:00+00:00",
+                    metadata={"evidence_role": "policy"})
+        for index in range(7):
+            self.record(f"recent-{index}", "窗外在下雨。", at=f"2020-06-01T13:0{index}:00+00:00")
+        self.record("opportunity", "有新的合奏点子可以分享。", kind="opportunity")
+        bridge = MemoryBridge(self.store)
+        turn = bridge.open_turn(self.scope, "opportunity")
+        self.assertEqual([hint["event_id"] for hint in turn["experience_hints"]], ["original"])
+        self.assertNotIn("text", turn["experience_hints"][0])
+        self.assertNotIn("original", {item["event_id"] for item in turn["recent_events"]})
+        self.assertIn("蓝色节拍器", bridge.call_tool(self.scope, "opportunity",
+                                                  "memory_read_evidence", {"ids": ["original"]})[0]["text"])
+
     def test_bridge_replay_prevents_tools_and_decisions_from_using_future_events(self):
         self.record("earlier", "上次说过一首歌。", at="2020-06-01T12:00:00+00:00")
         self.record("old-turn", "你还记得那首歌吗？", at="2020-06-01T13:00:00+00:00")
@@ -512,7 +567,7 @@ class ProtocolTests(unittest.TestCase):
         decision = {
             "action": "speak", "reply": "上次的电梯怪谈，我想到一个结尾。",
             "topic": "一起聊过的电梯怪谈", "reason": "补上上次没定的结局",
-            "evidence_ids": ["common-memory"],
+            "evidence_ids": ["common-memory"], "experience_quote": "电梯怪谈，结尾没定",
         }
         self.assertEqual(bridge.validate_decision(self.scope, "open", decision, now=now)["action"], "speak")
         self.assertEqual(bridge.validate_decision(self.scope, "closed", {"action": "wait"}, now=now)["action"], "wait")
@@ -526,6 +581,53 @@ class ProtocolTests(unittest.TestCase):
             bridge.validate_decision(self.scope, "open", {**decision, "evidence_ids": ["other-memory"]}, now=now)
         with self.assertRaises(ValueError):
             bridge.validate_decision(self.scope, "open", {**decision, "evidence_ids": ["open"]}, now=now)
+
+    def test_proactive_speech_needs_an_exact_quote_from_its_first_experience(self):
+        self.record("workshop", "我们上回做了一盏蓝色风灯。")
+        self.record("walk", "前天看见石桥下的一排小木屋。")
+        self.record("open", kind="opportunity", metadata={
+            "allowed": True, "expires_at": "2020-06-01T15:00:00+00:00",
+        })
+        bridge = MemoryBridge(self.store)
+        now = "2020-06-01T14:30:00+00:00"
+        decision = {
+            "action": "speak", "reply": "想到一个给风灯加光影的办法。",
+            "topic": "蓝色风灯", "reason": "延续上回一起做的东西",
+            "evidence_ids": ["workshop", "walk"], "experience_quote": "做了一盏蓝色风灯",
+        }
+        self.assertEqual(bridge.validate_decision(self.scope, "open", decision, now=now), decision)
+        for quote in ("", "风灯", "一排小木屋", "做了一盏紫色风灯", "风" * 121):
+            with self.subTest(quote=quote), self.assertRaises(ValueError):
+                bridge.validate_decision(self.scope, "open", {**decision, "experience_quote": quote}, now=now)
+        del decision["experience_quote"]
+        with self.assertRaises(ValueError):
+            bridge.validate_decision(self.scope, "open", decision, now=now)
+
+    def test_permission_and_habits_are_not_the_primary_proactive_experience(self):
+        self.record("permission", "我允许你在午间来聊聊。", metadata={"evidence_role": "policy"})
+        self.record("habit", "以后请用简短的招呼。")
+        self.assertEqual(self.add(event_id="habit", kind="habit", subject="招呼",
+                                  predicate="长度", value="简短")["status"], "applied")
+        self.record("shared", "上回我们一起做了杯豆乳咖啡。以后招呼可以短一点。",
+                    metadata={"evidence_role": "experience"})
+        self.assertEqual(self.add(event_id="shared", result_id="add-drink", kind="habit", subject="闲聊",
+                                  predicate="招呼", value="可短一些")["status"], "applied")
+        self.record("open", kind="opportunity", metadata={
+            "allowed": True, "expires_at": "2020-06-01T15:00:00+00:00",
+        })
+        bridge = MemoryBridge(self.store)
+        now = "2020-06-01T14:30:00+00:00"
+        decision = {
+            "action": "speak", "reply": "想起上回做的豆乳咖啡。",
+            "topic": "豆乳咖啡", "reason": "回到共同的体验",
+            "evidence_ids": ["shared", "permission", "habit"], "experience_quote": "一起做了杯豆乳咖啡",
+        }
+        self.assertEqual(bridge.validate_decision(self.scope, "open", decision, now=now), decision)
+        for source, quote in (("permission", "允许你在午间"), ("habit", "简短的招呼")):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                bridge.validate_decision(self.scope, "open", {
+                    **decision, "evidence_ids": [source, "shared"], "experience_quote": quote,
+                }, now=now)
 
     def test_restrict_hides_topic_from_proactive_tools_while_keeping_direct_recall(self):
         self.record("practice", "这是我们上次聊的爵士乐练习。")

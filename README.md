@@ -59,9 +59,10 @@ turn = bridge.open_turn(scope, "user-message-1", persona="耐心的编程辅导�
 
 | 字段 | 用途 |
 | --- | --- |
-| `protocol_version` | 确认这份协议的版本。不同模型适配器可以使用同一版本。 |
+| `protocol_version` | 当前为 `"2"`。适配器使用本轮返回的决策结构，区分普通回复和主动搭话。 |
 | `event` | 本轮触发原因和已观察的信息。事件类别包括 `user_message`、`assistant_message`、`tool_result`、`opportunity` 和 `feedback`。 |
 | `recent_events` | 最多六条近期互动短摘录，带时间和证据 ID。原话和反馈元数据可按需回查。 |
+| `experience_hints` | 主动机会专用。宿主给出话题线索时，至多带四条较早的共同经历 ID；由模型按需查阅原话。 |
 | `persona`、`language`、`habits` | 宿主提供角色说明和场景示例，框架补入这些场景可用的已确认习惯。暂定习惯可用回查工具选择。 |
 | `tools`、`decision_schema`、`instructions` | 可调用的工具、最终回答的结构，以及使用和解释结果的说明。 |
 
@@ -129,9 +130,15 @@ turn = bridge.open_turn(scope, "user-message-1", persona="耐心的编程辅导�
 
 **遗忘有两条硬边界。** 被用户明确要求保留的条目返回 `pinned`；原话或其登记派生内容还被其他记忆引用时返回 `shared_evidence`。两种情况都拒绝整个遗忘动作，保留所有内容。两项都无阻碍并获宿主批准时，才清除该条的原始证据和已登记派生。外部副本和备份由接入方管理。
 
-### 搭话和反馈
+### 普通回复
 
-用户消息和主动机会共用下面的决策结构。
+`{"action":"speak","reply":"……"}` 是普通发言格式，可以附 `evidence_ids` 供宿主追踪。用户明确说还有下半句时返回 `{"action":"wait"}`，需要收住时返回 `{"action":"skip"}`。只有 `wait` 可附 `review_at`。
+
+语言及语体先看用户本轮的明确要求，再看宿主的 `language` 默认值。宿主留空时读取已确认的语言习惯，最后才参考用户消息的语言。模型应在整段正文保持选定的语言与语体。寒暄、报喜和倾诉宜接住具体细节后收住。真正的指代歧义、求助缺少关键条件，或此前已经约定回访时，可以问一个具体问题。
+
+### 主动搭话和反馈
+
+宿主收到主动机会时使用专用的 `decision_schema`。如果选择开口，第一条证据必须是同一会话的具体共同经历，并附上从原话摘出的 `experience_quote`。
 
 ~~~json
 {
@@ -139,11 +146,14 @@ turn = bridge.open_turn(scope, "user-message-1", persona="耐心的编程辅导�
   "topic": "昨天排练留下的一小段",
   "reason": "共同经历明确，而且有一个新的练法可分享",
   "evidence_ids": ["rehearsal-message"],
+  "experience_quote": "慢一点的节拍",
   "reply": "我想到一个练法。先把最容易抢拍的两小节单独慢练。"
 }
 ~~~
 
-主动开口由宿主创建 `opportunity` 事件，提供 `metadata.allowed` 和带时区的 `metadata.expires_at`。用户打开主动搭话后，宿主可以定期给机会；模型自己从共同经历里找值得说的话。选择 `speak` 时必须有可用的同范围证据、话题和现在开口的理由。程序实际发出后再记录发言，并通过 `related_to` 关联用户反馈。回复轮数、会话长度等属于接入方记录的观察，模型结合原话解释这些反馈并提案更新习惯。
+主动开口由宿主创建 `opportunity` 事件，提供 `metadata.allowed` 和带时区的 `metadata.expires_at`。宿主可在用户允许的时段给机会，模型自己从共同经历里找值得说的话。`speak` 的首条证据要对应实际聊过的内容；框架会核对 4–120 字的原文摘录。仅供习惯或偏好引用的记录可作补充依据。若一条原话同时包含共同经历和偏好，宿主可用 `metadata.evidence_role = "experience"` 标记。`"policy"` 标记只作为政策或许可。用户保留话题的发起权、话题已经结束或缺乏共同经历时，可直接跳过；需要延后时选择等待。
+
+程序实际发出后再记录发言，并通过 `related_to` 关联用户反馈。回复轮数、会话长度等属于接入方记录的观察，模型结合原话解释这些反馈并提案更新习惯。
 
 ## 参考 spec（可修改草案）
 

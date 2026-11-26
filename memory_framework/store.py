@@ -227,6 +227,25 @@ class MemoryStore:
             return [event for event_id in ids if event_id not in restricted
                     if (event := self._event(db, scope.key, event_id, known_at)) is not None]
 
+    def _is_shared_experience(self, scope, event, known_at):
+        if event["kind"] == "opportunity" or not event["text"].strip():
+            return False
+        role = event["metadata"].get("evidence_role")
+        if role == "policy":
+            return False
+        if role == "experience":
+            return True
+        with closing(self._connect()) as db:
+            rows = db.execute("""
+                SELECT DISTINCT m.kind FROM evidence e
+                JOIN memories m ON m.id = e.memory_id
+                JOIN versions v ON v.memory_id = e.memory_id AND v.version = e.version
+                WHERE e.scope = ? AND e.event_id = ? AND m.forgotten = 0
+                  AND v.state = 'confirmed' AND v.recorded_at <= ?
+            """, (scope.key, event["event_id"], known_at))
+            kinds = {row[0] for row in rows}
+        return not kinds or bool(kinds - {"habit", "preference"})
+
     def recall(self, scope, query="", *, intent="current", anchor_ids=(), as_of=None, limit=8,
                known_at=None, for_initiative=False, exclude_kinds=(), exclude_event_id=None,
                confirmed_only=False):
